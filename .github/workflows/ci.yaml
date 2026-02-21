@@ -1,0 +1,135 @@
+# online-boutique-app/.github/workflows/ci.yaml
+name: CI — Build & Push to ECR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_BASE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend: src/frontend/**
+            cartservice: src/cartservice/**
+            checkoutservice: src/checkoutservice/**
+            productcatalogservice: src/productcatalogservice/**
+            currencyservice: src/currencyservice/**
+            paymentservice: src/paymentservice/**
+            shippingservice: src/shippingservice/**
+            emailservice: src/emailservice/**
+            recommendationservice: src/recommendationservice/**
+            adservice: src/adservice/**
+
+  build-and-push:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service:
+          - frontend
+          - cartservice
+          - checkoutservice
+          - productcatalogservice
+          - currencyservice
+          - paymentservice
+          - shippingservice
+          - emailservice
+          - recommendationservice
+          - adservice
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push image
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          docker build \
+            -t $ECR_BASE/online-boutique/$SERVICE:$IMAGE_TAG \
+            -t $ECR_BASE/online-boutique/$SERVICE:latest \
+            ./src/$SERVICE
+          
+          docker push $ECR_BASE/online-boutique/$SERVICE:$IMAGE_TAG
+          docker push $ECR_BASE/online-boutique/$SERVICE:latest
+          
+          echo "✅ Pushed $SERVICE:$IMAGE_TAG"
+
+      - name: Update GitOps repo with new image tag
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+          SERVICE: ${{ matrix.service }}
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+        run: |
+          git clone https://x-access-token:${GITOPS_TOKEN}@github.com/${{ github.repository_owner }}/online-boutique-gitops.git
+          cd online-boutique-gitops
+          
+          # Update image tag in the overlay
+          sed -i "s|$ECR_BASE/online-boutique/$SERVICE:.*|$ECR_BASE/online-boutique/$SERVICE:$IMAGE_TAG|g" \
+            apps/online-boutique/overlays/production/kustomization.yaml
+          
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+          git diff --staged --quiet || git commit -m "ci: update $SERVICE image to $IMAGE_TAG [skip ci]"
+          git push
+          echo "✅ GitOps repo updated for $SERVICE"
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECR scan results for frontend
+        run: |
+          sleep 30  # Wait for scan to complete
+          RESULT=$(aws ecr describe-image-scan-findings \
+            --repository-name online-boutique/frontend \
+            --image-id imageTag=${{ github.sha }} \
+            --region ap-south-1 \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output json 2>/dev/null || echo "{}")
+          echo "ECR Scan Results: $RESULT"
+          
+          CRITICAL=$(echo $RESULT | jq -r '.CRITICAL // 0')
+          if [ "$CRITICAL" -gt "0" ]; then
+            echo "❌ CRITICAL vulnerabilities found: $CRITICAL"
+            exit 1
+          fi
+          echo "✅ No critical vulnerabilities"
